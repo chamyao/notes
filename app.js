@@ -464,7 +464,7 @@
 
   /* ---------- sync ---------- */
   const Sync = (() => {
-    let timer = 0, busy = false, again = false, state = "", tap = false, relock = null;
+    let timer = 0, busy = false, again = false, state = "", tap = false, relock = null, renewing = false;
     const setState = (s, needTap = false) => { state = s; tap = needTap; const b = document.querySelector(".sync.state"); if (b) { b.textContent = state; b.classList.toggle("tap", tap); } };
     const button = () => `<button type="button" class="sync state${tap ? " tap" : ""}" aria-live="polite">${state}</button>`;
     document.addEventListener("click", async ev => {
@@ -506,7 +506,12 @@
       } catch (e) {
         console.warn("[sync]", e);
         if (e.differs) { relock = e.lock; setState("Enter your password to sync", true); }
-        else if (e.needTap || /sign-in|popup/i.test(e.message)) setState(/tick the Drive box/.test(e.message) ? "Allow Drive access to sync" : "Sign in to sync", true);
+        else if (e.needTap || /sign-in|popup/i.test(e.message)) {
+          const drive = /tick the Drive box/.test(e.message);
+          setState(drive ? "Allow Drive access to sync" : "Sign in to sync", true);
+          // Google lets the sign-in renew only from a click: the next one anywhere does it
+          if (!drive && !renewing) { renewing = true; addEventListener("pointerdown", () => { renewing = false; Drive.auth("").then(() => soon(0), () => setState("Sign in to sync", true)); }, { once: true, capture: true }); }
+        }
         else setState(navigator.onLine ? "Sync paused: " + (e.message || e) : "Offline, will sync");
       }
       busy = false; if (again) { again = false; soon(0); }
@@ -565,34 +570,39 @@
   })();
 
   /* ---------- a browser without the key: sign in to Google, then the password (or create it, the very first time) ---------- */
+  // a browser without the key: just the password. Pressing Open is also when Google is asked (once per browser,
+  // as Google requires) for the Drive the notes are in; only the very first time ever is a password created.
   async function gate() {
     document.title = "Notes";
-    let mode = "signin", lock = null;
-    const H1 = { signin: "Notes", create: "Create a password", enter: "Password", wait: "Notes" };
+    let mode = "enter", lock = null, pw1 = "";
     const draw = (msg = "") => {
       app.innerHTML = `<section class="gate"><form autocomplete="on">
-        <h1>${H1[mode]}</h1>
-        ${mode === "wait" ? `<p class="gmsg">Connecting…</p>` : mode === "signin" ? `<p class="gmsg">${navigator.onLine ? "Sign in with the Google account your notes are kept in." : "Connect to the internet to open your notes on this browser."}</p><button type="button" class="gbtn google">Sign in with Google</button>` : `
+        <h1>${mode === "create" ? "Create a password" : "Password"}</h1>
         <input type="text" name="username" autocomplete="username" value="notes" hidden>
         <label for="pw" class="mirror">Password</label>
         <input id="pw" type="password" autocomplete="${mode === "create" ? "new-password" : "current-password"}">
         ${mode === "create" ? `<label for="pw2" class="gsub">Again</label><input id="pw2" type="password" autocomplete="new-password">
-        <p class="gnote">Your notes are scrambled with it. There's no way to get them back without it: a long one, like a few random words, is best.</p>` : ""}
-        <button type="submit" class="gbtn">${mode === "create" ? "Create" : "Open"}</button>`}
+        <p class="gnote">This is the first time: your notes will be scrambled with this password, and there's no way to get them back without it. A long one, like a few random words, is best.</p>` : ""}
+        <button type="submit" class="gbtn">${mode === "create" ? "Create" : "Open"}</button>
         <p class="gmsg err" role="alert">${msg}</p></form></section>`;
-      const pw = $("#pw"); if (pw) pw.focus();
-      const g = app.querySelector(".google"); if (g) g.onclick = () => signin("consent");
-      app.querySelector("form").onsubmit = ev => { ev.preventDefault(); if (mode === "create") create(); else if (mode === "enter") enter(); };
+      const pw = $("#pw"); if (pw) { pw.value = pw1; pw.focus(); if (mode === "create" && pw1) $("#pw2").focus(); }
+      app.querySelector("form").onsubmit = ev => { ev.preventDefault(); if (mode === "create") create(); else open(); };
     };
     const busy = t => { const b = app.querySelector(".gbtn"); if (b) { b.disabled = !!t; if (t) b.textContent = t; } };
-    async function signin(prompt) {
-      busy("Signing in…");
-      try { if (prompt) await Drive.auth(prompt); await Drive.list(); lock = JSON.parse(await Drive.read("lock.json") || "null"); }
-      catch (e) { console.warn(e); mode = "signin"; return draw(prompt ? "Couldn't sign in: " + (e.message || e) : ""); }
-      mode = lock ? "enter" : "create"; draw();
+    async function open() {
+      pw1 = $("#pw").value;
+      if (!navigator.onLine) return draw("Connect to the internet to open your notes on this browser.");
+      busy("Opening…");
+      try {
+        if (!lock) { if (!Drive.ready()) await Drive.auth(Drive.signedIn() ? "" : "consent"); await Drive.list(); lock = JSON.parse(await Drive.read("lock.json") || "null"); }
+      } catch (e) { console.warn(e); return draw("Couldn't reach your Drive: " + (e.message || e)); }
+      if (!lock) { mode = "create"; return draw(); }
+      const k = await derive(pw1, lock.salt);
+      if (!(await fits(k, lock))) { pw1 = ""; return draw("Wrong password."); }
+      await unlocked(k);
     }
     async function create() {
-      const a = $("#pw").value, b = $("#pw2").value;
+      const a = $("#pw").value, b = $("#pw2").value; pw1 = a;
       if (a.length < 8) return draw("At least 8 characters.");
       if (a !== b) return draw("Those two don't match.");
       busy("Creating…");
@@ -600,14 +610,7 @@
       try { await Drive.write("lock.json", await lockFor(k), "application/json"); } catch (e) { return draw("Couldn't save to Drive: " + (e.message || e)); }
       await unlocked(k);
     }
-    async function enter() {
-      busy("Opening…");
-      const k = await derive($("#pw").value, lock.salt);
-      if (!(await fits(k, lock))) return draw("Wrong password.");
-      await unlocked(k);
-    }
-    // signed in already (a browser from the weeks without a password): straight to the password
-    if (Drive.ready() && navigator.onLine) { mode = "wait"; draw(); await signin(""); } else draw();
+    draw();
   }
   async function unlocked(k) {
     K = k; await Keys.save(k).catch(() => {});
