@@ -363,6 +363,7 @@
   addEventListener("mousedown", ev => { if (!listEl.hidden && !listEl.contains(ev.target)) closeList(); });
   // where in the window a character of the textarea is drawn
   function caretXY(ta, at) {
+    if (ta.tagName === "INPUT") { const r = ta.getBoundingClientRect(); return { x: r.left, y: r.bottom - 2 }; } // the calendar's cursor: just under it
     const m = document.createElement("div"), cs = getComputedStyle(ta);
     m.className = "mirror";
     for (const p of ["font", "lineHeight", "letterSpacing", "paddingTop", "paddingLeft", "paddingRight", "borderWidth", "boxSizing"]) m.style[p] = cs[p];
@@ -376,6 +377,7 @@
   /* ---------- menus ---------- */
   function show(el, x, y) {
     el.hidden = false; const w = el.offsetWidth, h = el.offsetHeight;
+    if (!Number.isFinite(x)) x = 16; if (!Number.isFinite(y)) y = 16;
     el.style.left = Math.max(16, Math.min(x, innerWidth - w - 16)) + "px";
     el.style.top = (y + h > innerHeight - 8 ? Math.max(8, y - h - 36) : y) + "px";
   }
