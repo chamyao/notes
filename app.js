@@ -100,6 +100,7 @@
     if (h[0] === "d" && /^\d{4}-\d{2}-\d{2}$/.test(h[1])) return page("d:" + h[1], h[2] === "photos");
     if (h[0] === "n" && h[1]) return page("n:" + h[1], h[2] === "photos");
     if (h[0] === "feedback") return feedback();
+    if (h[0] === "setup") return setup();
     const m = /^(\d{4})-(\d{2})$/.exec(h[0] || "");
     const t = today().split("-").map(Number);
     month(m ? +m[1] : t[0], m ? +m[2] : t[1]);
@@ -300,6 +301,40 @@
     go(o.h);
   }
 
+  /* ---------- #/setup: make the vault, once (Google's long-lasting pass + the client secret, scrambled here) ---------- */
+  function setup() {
+    current = null; document.title = "Setup · Notes";
+    app.innerHTML = `<section class="page"><div class="bar"><button type="button" class="icon back" aria-label="Back">←</button></div>
+      <div class="fb"><h1>Password-only sign-in</h1>
+        <p class="gmsg">Paste the client secret of your Google Cloud OAuth client (Credentials → your client). It's scrambled with your password in this browser before anything leaves it.</p>
+        <label for="cs" class="mirror">Client secret</label><input id="cs" class="sfield" type="password" autocomplete="off" spellcheck="false">
+        <div class="fbrow"><button type="button" class="send go">Approve Google, once</button><span class="fbmsg" role="status"></span></div>
+        <div class="vout" hidden><p class="gmsg">Done. This is the vault, scrambled: send it to Claude, or add it to the notes repo as <b>vault.json</b>. Once it's published, a password is all any browser asks for.</p>
+        <textarea class="vtext" readonly></textarea><div class="fbrow"><button type="button" class="send copy">Copy</button><span class="fbmsg c2" role="status"></span></div></div></div></section>`;
+    app.querySelector(".back").onclick = () => go(lastMonth());
+    const msg = app.querySelector(".fbmsg"), out = app.querySelector(".vout"), text = app.querySelector(".vtext");
+    app.querySelector(".go").onclick = async () => {
+      const cs = $("#cs").value.trim(); if (!cs) { msg.textContent = "Paste the client secret first."; return; }
+      if (!window.google || !google.accounts) { msg.textContent = "Google's sign-in didn't load; reload and try again."; return; }
+      msg.textContent = "";
+      google.accounts.oauth2.initCodeClient({
+        client_id: CLIENT_ID, scope: "https://www.googleapis.com/auth/drive.file", ux_mode: "popup", select_account: false,
+        callback: async r => {
+          if (r.error) { msg.textContent = "Google: " + r.error; return; }
+          msg.textContent = "Saving…";
+          try {
+            const j = await Drive.grant({ grant_type: "authorization_code", code: r.code, client_secret: cs, redirect_uri: "postmessage" });
+            if (!j.refresh_token) throw new Error("Google gave no long-lasting pass: remove the app at myaccount.google.com/permissions and try again");
+            text.value = JSON.stringify({ v: 1, salt: K.salt, data: await sealText(JSON.stringify({ rt: j.refresh_token, cs })) });
+            out.hidden = false; msg.textContent = ""; $("#cs").value = "";
+          } catch (e) { msg.textContent = e.message || String(e); }
+        },
+        error_callback: e => { msg.textContent = "Google: " + (e.type || "closed"); },
+      }).requestCode();
+    };
+    app.querySelector(".copy").onclick = async () => { try { await navigator.clipboard.writeText(text.value); app.querySelector(".c2").textContent = "Copied."; } catch { text.select(); document.execCommand("copy"); app.querySelector(".c2").textContent = "Copied."; } };
+  }
+
   /* ---------- *backup: one file with everything, still scrambled (the password opens it), saved to this device ---------- */
   async function backup() {
     const photos = {};
@@ -411,8 +446,35 @@
         client.requestAccessToken({ prompt });
       });
     }
+    // the vault (vault.json, published with the site): Google's long-lasting pass and the app's client secret,
+    // scrambled with the notes password. With it, a browser that knows the password renews access by itself:
+    // no Google window, ever. Made once on #/setup.
+    let vault;
+    async function loadVault() {
+      if (vault !== undefined) return vault;
+      try { const r = await fetch("vault.json?" + Date.now(), { cache: "no-store" }); vault = r.ok ? await r.json() : null; } catch { vault = null; }
+      return vault;
+    }
+    const TOKEN = "https://oauth2.googleapis.com/token";
+    async function grant(body) {
+      const r = await fetch(TOKEN, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ client_id: CLIENT_ID, ...body }) });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || !j.access_token) throw new Error("Google: " + (j.error_description || j.error || r.status));
+      tok = { t: j.access_token, exp: Date.now() + (j.expires_in - 120) * 1000 };
+      try { localStorage.setItem(TOK, JSON.stringify(tok)); } catch {}
+      return j;
+    }
+    async function renew(key) {
+      const v = await loadVault();
+      if (v && (key || K)) {
+        const was = K; if (key) K = key;
+        try { const { rt, cs } = JSON.parse(await openText(v.data)); return await grant({ grant_type: "refresh_token", refresh_token: rt, client_secret: cs }); }
+        finally { if (key) K = was; }
+      }
+      return auth("");
+    }
     async function call(url, opt = {}, retry = true) {
-      if (!tok || tok.exp < Date.now()) await auth("");
+      if (!tok || tok.exp < Date.now()) await renew();
       const r = await fetch(url, { ...opt, headers: { ...(opt.headers || {}), Authorization: "Bearer " + tok.t } });
       if (r.status === 401 && retry) { tok = null; return call(url, opt, false); }
       if (!r.ok) {
@@ -455,7 +517,7 @@
       return as === "bytes" ? new Uint8Array(await r.arrayBuffer()) : as === "blob" ? r.blob() : r.text();
     }
     async function del(name) { if (!files) await list(); if (files[name]) { await call(`${API}/${files[name]}`, { method: "DELETE" }); delete files[name]; } }
-    return { auth, list, write, read, del, signedIn, has: n => !!(files && files[n]), names: () => Object.keys(files || {}), ready: () => !!tok && tok.exp > Date.now() };
+    return { auth, renew, grant, loadVault, list, write, read, del, signedIn, has: n => !!(files && files[n]), names: () => Object.keys(files || {}), ready: () => !!tok && tok.exp > Date.now() };
   })();
   // lock.json: the salt, and a known word scrambled with the key (a wrong password can't unscramble it)
   const CHECK = "notes-ok";
@@ -593,6 +655,15 @@
       pw1 = $("#pw").value;
       if (!navigator.onLine) return draw("Connect to the internet to open your notes on this browser.");
       busy("Opening…");
+      // the vault: the password alone opens it, and with it Drive
+      const v = await Drive.loadVault();
+      if (v) {
+        const k = await derive(pw1, v.salt);
+        try { await Drive.renew(k); } catch (e) { if (/OperationError|decrypt/i.test(String(e && (e.name || e.message)))) { pw1 = ""; return draw("Wrong password."); } return draw("Couldn't reach your Drive: " + (e.message || e)); }
+        try { await Drive.list(); lock = JSON.parse(await Drive.read("lock.json") || "null"); } catch (e) { return draw("Couldn't reach your Drive: " + (e.message || e)); }
+        if (lock && !(await fits(k, lock))) { pw1 = ""; return draw("Wrong password."); }
+        return unlocked(k);
+      }
       try {
         if (!lock) { if (!Drive.ready()) await Drive.auth(Drive.signedIn() ? "" : "consent"); await Drive.list(); lock = JSON.parse(await Drive.read("lock.json") || "null"); }
       } catch (e) { console.warn(e); return draw("Couldn't reach your Drive: " + (e.message || e)); }
